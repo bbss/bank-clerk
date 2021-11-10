@@ -57,7 +57,59 @@
 ;;}
 ;;```
 
+;;BB: Let's start off setting up a database:
+(require '[clojure.java.io :as io]
+         '[xtdb.api :as xt])
 
+(defn start-xtdb! []
+  (let [_run-at #inst "2021-11-10T15:09:43.090-00:00"]
+    (xt/start-node
+     {:xtdb/tx-log {:kv-store {:xtdb/module 'xtdb.rocksdb/->kv-store
+                               :db-dir (io/file "data/dev/tx-log")
+                               :sync? true}}
+      :xtdb/document-store {:kv-store {:xtdb/module 'xtdb.rocksdb/->kv-store
+                                       :db-dir (io/file "data/dev/doc-store")
+                                       :sync? true}}
+      :xtdb/index-store {:kv-store {:xtdb/module 'xtdb.rocksdb/->kv-store
+                                    :db-dir (io/file "data/dev/index-store")
+                                    :sync? true}}})))
+
+
+;;BB: Hmmm, Clerk tries to restart the node when it's still running, which leads to a lockfile error. No biggie, we'll close the node on each namespace refresh and wait a little while to start the node:
+
+(declare node)
+
+(def node
+  (if (bound? (var node))
+    node
+    (start-xtdb!)))
+
+(comment (.close node))
+
+;;BB: Now we have a database node to transact and query against we can start working on the first feature. Let's turn the json object into clojure EDN and put it in DB.
+
+(require '[clojure.data.json :as json])
+
+(def mr-black-as-edn
+  (json/read-json
+   "{
+   \"account-number\": 1,
+   \"name\": \"Mr. Black\",
+   \"balance\": 0
+   }"))
+
+(defn add-account-number-as-id [entity]
+  (assoc entity
+         :xt/id
+         (:account-number entity)))
+
+(def create-mr-black-transaction (add-account-number-as-id mr-black-as-edn))
+
+(xt/submit-tx
+ node
+ [[::xt/put create-mr-black-transaction]])
+
+(xt/entity (xt/db node) 1)
 
 ;; ## Feature 2 - View a bank account
 
@@ -80,8 +132,19 @@
 ;;  }
 ;;```
 
+;;BB: use pull syntax to form an object from the fields we desire of the entity
 
+(let [mr-black-edn (xt/pull (xt/db node)
+                            [:account-number :name :balance]
+                            1)]
+  (json/write-str mr-black-edn))
 
+(defn account-number->bank-account [account-number]
+  (xt/pull (xt/db node)
+           [:account-number :name :balance]
+           account-number))
+
+(json/write-str (account-number->bank-account 1))
 
 ;; ## Feature 3 - Deposit money to an account
 
@@ -115,7 +178,22 @@
 ;;}
 ;;```
 
+;;BB let's grab the current balance and add the deposited amount, then we submit the database. We will add a match transaction for this, this ensures nothing happened to the entity during getting the current balance and updating it, no infinite money glitches!
 
+(let [deposit 100
+      mr-black-poor (account-number->bank-account 1)
+      mr-black-rich (update mr-black-poor :balance + deposit)]
+  mr-black-rich)
+
+(defn deposit-to-account [amount account-number]
+  (let [before (xt/entity (xt/db node) account-number)
+        after  (update before :balance + amount)
+        transaction [[::xt/match account-number before]
+                     [::xt/put after]]]
+    (xt/await-tx node (xt/submit-tx node transaction))
+    (account-number->bank-account account-number)))
+
+(deposit-to-account 101 1)
 
 ;; ## Feature 4 - Withdraw money from an account
 
@@ -148,6 +226,23 @@
 ;;  }
 ;;```
 
+;;BB Same as deposits, but adding some checks to the resulting balance
+
+
+(defn withdraw-from-account [amount account-number]
+  {:pre [(pos? amount)]}
+  (let [before (xt/entity (xt/db node) account-number)
+        after  (update before :balance - amount)
+        transaction [[::xt/match account-number before]
+                     [::xt/put after]]]
+    (if (>= (:balance after) 0)
+      (do (xt/await-tx node (xt/submit-tx node transaction))
+          (account-number->bank-account account-number))
+      (throw (Exception. "Can't withdraw more than you own. Get a capitalism-plus-account for going into debt. It'll be great.")))))
+
+(withdraw-from-account -100 1)
+
+(withdraw-from-account 100 1)
 
 ;; ## Feature 5 - Transfer money between accounts
 
@@ -181,6 +276,59 @@
 ;;  name: "Mr. Black",
 ;;  "balance": 45
 ;;  }
+
+;;BB in this case we match both the before and after accounts.
+
+(defn transfer-amount-from-sender-to-receiver [amount sender-account-number receiver-account-number]
+  {:pre [(pos? amount)]}
+  (let [sender-before (xt/entity (xt/db node) sender-account-number)
+        sender-after  (update sender-before :balance - amount)
+        receiver-before   (xt/entity (xt/db node) receiver-account-number)
+        receiver-after    (update sender-before :balance + amount)
+        transaction [[::xt/match sender-account-number sender-before]
+                     [::xt/put sender-after]
+                     [::xt/match receiver-account-number receiver-before]
+                     [::xt/put receiver-after]]]
+    (cond
+      (< (:balance sender-after) 0)
+      (throw (Exception. "Can't withdraw more than you own. Get a capitalism-plus-account for going into debt. It'll be great."))
+      (not (seq receiver-before))
+      (throw (Exception. "Receiver doesn't exist. Don't burn money, this isn't crypto."))
+      (not (seq sender-before))
+      (throw (Exception. "Sender doesn't exist."))
+      :else
+      (do (xt/await-tx node (xt/submit-tx node transaction))
+          (account-number->bank-account sender-account-number)))))
+
+(transfer-amount-from-sender-to-receiver 50 2 800)
+
+;;BB This works, but could be improved: it doesn't compose with the deposit and withdraw functions for feature 3 and 4. They do too much for that. We could refactor them to just return the transaction data and do the checks. And this transfer function could then do the actual transaction.
+
+(defn deposit-to-account-composable [amount account-number]
+  (let [before (xt/entity (xt/db node) account-number)
+        after  (update before :balance + amount)
+        transaction [[::xt/match account-number before]
+                     [::xt/put after]]]
+    (if (seq before)
+      transaction
+      (throw (Exception. "Sender doesn't exist.")))))
+
+(defn withdraw-from-account-composable [amount account-number]
+  {:pre [(pos? amount)]}
+  (let [before (xt/entity (xt/db node) account-number)
+        after  (update before :balance - amount)
+        transaction [[::xt/match account-number before]
+                     [::xt/put after]]]
+    (if (>= (:balance after) 0)
+      transaction
+      (throw (Exception. "Can't withdraw more than you own. Get a capitalism-plus-account for going into debt. It'll be great.")))))
+
+(defn transfer-amount-from-sender-to-receiver-composed [amount sender-account-number receiver-account-number]
+  (let [withdraw-tx-data (withdraw-from-account-composable amount sender-account-number)
+        deposit-tx-data  (deposit-to-account-composable amount receiver-account-number)
+        transaction-data (vector withdraw-tx-data deposit-tx-data)]
+    (xt/await-tx node (xt/submit-tx node transaction-data))
+    (account-number->bank-account sender-account-number)))
 
 ;; ## Feature 6 - Retrieve account audit log
 
