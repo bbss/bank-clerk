@@ -1,0 +1,7 @@
+{:paths ["src" "resources"]
+ :deps  {io.github.nextjournal/clerk {:mvn/version "0.2.214"}
+         com.xtdb/xtdb-core    {:mvn/version "1.19.0"}
+         com.xtdb/xtdb-rocksdb {:mvn/version "1.19.0"}
+         org.clojure/data.json {:mvn/version "2.4.0"}
+         http-kit/http-kit     {:mvn/version "2.5.3"}
+         org.clojars.askonomm/ruuter {:mvn/version "1.2.2"}}}
