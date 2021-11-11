@@ -79,7 +79,7 @@
 
 (declare node)
 
-(def node
+(defonce node
   (if (bound? (var node))
     node
     (start-xtdb!)))
@@ -105,9 +105,10 @@
 
 (def create-mr-black-transaction (add-account-number-as-id mr-black-as-edn))
 
-(xt/submit-tx
- node
- [[::xt/put create-mr-black-transaction]])
+(xt/await-tx node
+ (xt/submit-tx
+  node
+  [[::xt/put create-mr-black-transaction]]))
 
 (xt/entity (xt/db node) 1)
 
@@ -281,17 +282,18 @@
 ;;BB in this case we match both the before and after accounts.
 
 ;;create accounts so our transactions don't error
-(xt/submit-tx
- node
- [[::xt/put {:xt/id 2
-             :name "Mr. White"
-             :account-number 2
-             :balance 1000}]
-  [::xt/put {:xt/id 800
-             :name "Mr. Gray"
-             :account-number 800
-             :balance 1000}]])
 
+(xt/await-tx node
+ (xt/submit-tx
+  node
+  [[::xt/put {:xt/id 2
+              :name "Mr. White"
+              :account-number 2
+              :balance 1000}]
+   [::xt/put {:xt/id 800
+              :name "Mr. Gray"
+              :account-number 800
+              :balance 1000}]]))
 
 (defn transfer-amount-from-sender-to-receiver [amount sender-account-number receiver-account-number]
   {:pre [(pos? amount)]}
@@ -378,7 +380,7 @@
 ;; - withdraw $20 from account #1
 
 ;; The endpoint responds with this body:
-
+;;```json
 ;; [
 ;;  {
 ;;   "sequence": 3,
@@ -401,3 +403,171 @@
 ;;   "description": "deposit"
 ;;   }
 ;;  ]
+;;```
+
+;;BB cool, XTDB has a open-tx-log api that can help out here. Let's open a fresh in-memory node so we can apply the test data. While we're at it let's refactor the transfer, withdraw and deposit functions to take the node as an argument instead of referring to the node in the namespace scope.
+
+(def fresh-node (xt/start-node {}))
+
+(defn on-node-deposit-to-account [node amount account-number]
+  (let [before (xt/entity (xt/db node) account-number)
+        after  (update before :balance + amount)
+        transaction [[::xt/match account-number before]
+                     [::xt/put after]]]
+    (if (seq before)
+      transaction
+      (throw (Exception. "Sender doesn't exist.")))))
+
+(defn on-node-withdraw-from-account [node amount account-number]
+  {:pre [(pos? amount)]}
+  (let [before (xt/entity (xt/db node) account-number)
+        after  (update before :balance - amount)
+        transaction [[::xt/match account-number before]
+                     [::xt/put after]]]
+    (if (>= (:balance after) 0)
+      transaction
+      (throw (Exception. "Can't withdraw more than you own. Get a capitalism-plus-account for going into debt. It'll be great.")))))
+
+(defn on-node-transfer-amount-from-sender-to-receiver [node amount sender-account-number receiver-account-number]
+  (let [withdraw-tx-data (on-node-withdraw-from-account node amount sender-account-number)
+        deposit-tx-data  (on-node-deposit-to-account node amount receiver-account-number)
+        transaction-data (concat withdraw-tx-data deposit-tx-data)]
+
+    (xt/await-tx node (xt/submit-tx node transaction-data))
+    (account-number->bank-account sender-account-number)))
+
+(def test-mutations
+  [{:type :create-account
+    :starting-balance 100
+    :account-number 1}
+   {:type :create-account
+    :starting-balance 100
+    :account-number 900}
+   {:type :create-account
+    :starting-balance 100
+    :account-number 800}
+   {:type :deposit
+    :amount 100
+    :to 1}
+   {:type :transfer
+    :amount 5
+    :from 1
+    :to 900}
+   {:type :transfer
+    :amount 10
+    :from 800
+    :to 1}
+   {:type :withdraw
+    :amount 20
+    :from 1}])
+
+(defmulti bank-employee-instructions (comp :type second vector))
+
+(defmethod bank-employee-instructions :create-account
+  [node {:keys [starting-balance
+                account-number]}]
+  (->> [[::xt/put (add-account-number-as-id
+                   {:balance starting-balance
+                    :account-number account-number
+                    :name (str "Client " account-number)})]]
+       (xt/submit-tx node)
+       (xt/await-tx node)))
+
+(defmethod bank-employee-instructions :deposit
+  [node {:keys [amount to]}]
+  (->> (on-node-deposit-to-account node amount to)
+       (xt/submit-tx node)
+       (xt/await-tx node)))
+
+(defmethod bank-employee-instructions :transfer
+  [node {:keys [amount from to]}]
+  (xt/await-tx node
+               (on-node-transfer-amount-from-sender-to-receiver node amount from to)))
+
+(defmethod bank-employee-instructions :withdraw
+  [node {:keys [amount from]}]
+  (->> (on-node-withdraw-from-account node amount from)
+       (xt/submit-tx node)
+       (xt/await-tx node)))
+
+(def employee-instructions-working-at-fresh-node
+  (partial bank-employee-instructions fresh-node))
+
+(doall
+ (for [mutation test-mutations]
+   (apply employee-instructions-working-at-fresh-node [mutation])))
+
+(with-open [cursor (xt/open-tx-log fresh-node nil true)]
+  (let [result (iterator-seq cursor)]
+    (def log result)))
+
+;;BB As we can see the log has information on the transactions as they happened. We can deduce that the fourth transaction was a deposit, the fifth a transfer etc. from the tx operations. Then shape the response into the desired {:sequence x :debit y :description z} format. After filtering and shaping the log we reverse it for the chronological order requirement. I would recommend using the tx-id for the sequence to stay close to the data the database uses: Note that since we use two match and puts in the same transaction for transfers we wouldn't have a -by-one-incremented- sequence id. So to stay true to the assignment we'll assign a sequence id manually.
+
+(let [{::xt/keys [tx-id tx-ops]} (nth log 3)
+      [[_ _ {balance-before :balance}]
+       [_ {balance-after :balance}]] tx-ops
+      difference-balance (- balance-after balance-before)]
+  (if (pos? difference-balance)
+    {:credit difference-balance
+     :description "deposit"}
+    {:debit (Math/abs difference-balance)
+     :description "withdraw"}))
+
+(let [audit-log-for-account 1
+      {::xt/keys [tx-id tx-ops]} (nth log 4) ;;(nth log 5)
+      [[_ _ {balance-before :balance}]
+       [_ {balance-after :balance
+           sender-account :account-number}]
+       _
+       [_ {receiver-account :account-number}]] tx-ops
+      difference-balance (- balance-after balance-before)]
+  (cond (= receiver-account audit-log-for-account)
+        {:debit (Math/abs difference-balance)
+         :description
+         (str "receive from #" sender-account)}
+        (= sender-account audit-log-for-account)
+        {:debit (Math/abs difference-balance)
+         :description
+         (str "send to #" receiver-account)}))
+
+(defn grab-audit-item [audit-log-for-account {::xt/keys [tx-id tx-ops]}]
+  (let [[[_ _ {balance-before :balance}]
+         [_ {sender-account :account-number
+             balance-after :balance}]
+         _
+         [_ {receiver-account :account-number}]] tx-ops
+        ]
+    (when (and balance-before balance-after)
+      (let [difference-balance (- balance-after balance-before)]
+        (cond
+          (= receiver-account audit-log-for-account)
+          {:credit (Math/abs difference-balance)
+           :description
+           (str "receive from #" sender-account)}
+          (and receiver-account
+               (= sender-account audit-log-for-account))
+          {:debit (Math/abs difference-balance)
+           :description
+           (str "send to #" receiver-account)}
+          (and (= sender-account audit-log-for-account)
+               (pos? difference-balance))
+          {:credit difference-balance
+           :description "deposit"}
+          (= sender-account audit-log-for-account)
+          {:debit (Math/abs difference-balance)
+           :description "withdraw"})))))
+
+(->> log
+     (keep (partial grab-audit-item 1))
+     (map-indexed (fn [i item]
+                    (assoc item :sequence i)))
+     reverse)
+
+(defn audit-log-for-account-id [node id]
+  (with-open [cursor (xt/open-tx-log node nil true)]
+    (let [log (iterator-seq cursor)]
+      (->> log
+           (keep (partial grab-audit-item id))
+           (map-indexed (fn [i item]
+                          (assoc item :sequence i)))
+           reverse))))
