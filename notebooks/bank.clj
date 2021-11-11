@@ -79,7 +79,7 @@
 
 (declare node)
 
-(defonce node
+(def node
   (if (bound? (var node))
     node
     (start-xtdb!)))
@@ -465,11 +465,12 @@
 
 (defmethod bank-employee-instructions :create-account
   [node {:keys [starting-balance
-                account-number]}]
+                account-number
+                name]}]
   (->> [[::xt/put (add-account-number-as-id
                    {:balance starting-balance
                     :account-number account-number
-                    :name (str "Client " account-number)})]]
+                    :name (or name account-number)})]]
        (xt/submit-tx node)
        (xt/await-tx node)))
 
@@ -497,38 +498,41 @@
  (for [mutation test-mutations]
    (apply employee-instructions-working-at-fresh-node [mutation])))
 
+(declare log)
+
 (with-open [cursor (xt/open-tx-log fresh-node nil true)]
   (let [result (iterator-seq cursor)]
     (def log result)))
 
 ;;BB As we can see the log has information on the transactions as they happened. We can deduce that the fourth transaction was a deposit, the fifth a transfer etc. from the tx operations. Then shape the response into the desired {:sequence x :debit y :description z} format. After filtering and shaping the log we reverse it for the chronological order requirement. I would recommend using the tx-id for the sequence to stay close to the data the database uses: Note that since we use two match and puts in the same transaction for transfers we wouldn't have a -by-one-incremented- sequence id. So to stay true to the assignment we'll assign a sequence id manually.
 
-(let [{::xt/keys [tx-id tx-ops]} (nth log 3)
-      [[_ _ {balance-before :balance}]
-       [_ {balance-after :balance}]] tx-ops
-      difference-balance (- balance-after balance-before)]
-  (if (pos? difference-balance)
-    {:credit difference-balance
-     :description "deposit"}
-    {:debit (Math/abs difference-balance)
-     :description "withdraw"}))
+(comment
+  (let [{::xt/keys [tx-id tx-ops]} (nth log 3)
+        [[_ _ {balance-before :balance}]
+         [_ {balance-after :balance}]] tx-ops
+        difference-balance (- balance-after balance-before)]
+    (if (pos? difference-balance)
+      {:credit difference-balance
+       :description "deposit"}
+      {:debit (Math/abs difference-balance)
+       :description "withdraw"}))
 
-(let [audit-log-for-account 1
-      {::xt/keys [tx-id tx-ops]} (nth log 4) ;;(nth log 5)
-      [[_ _ {balance-before :balance}]
-       [_ {balance-after :balance
-           sender-account :account-number}]
-       _
-       [_ {receiver-account :account-number}]] tx-ops
-      difference-balance (- balance-after balance-before)]
-  (cond (= receiver-account audit-log-for-account)
-        {:debit (Math/abs difference-balance)
-         :description
-         (str "receive from #" sender-account)}
-        (= sender-account audit-log-for-account)
-        {:debit (Math/abs difference-balance)
-         :description
-         (str "send to #" receiver-account)}))
+  (let [audit-log-for-account 1
+        {::xt/keys [tx-id tx-ops]} (nth log 4) ;;(nth log 5)
+        [[_ _ {balance-before :balance}]
+         [_ {balance-after :balance
+             sender-account :account-number}]
+         _
+         [_ {receiver-account :account-number}]] tx-ops
+        difference-balance (- balance-after balance-before)]
+    (cond (= receiver-account audit-log-for-account)
+          {:debit (Math/abs difference-balance)
+           :description
+           (str "receive from #" sender-account)}
+          (= sender-account audit-log-for-account)
+          {:debit (Math/abs difference-balance)
+           :description
+           (str "send to #" receiver-account)})))
 
 (defn grab-audit-item [audit-log-for-account {::xt/keys [tx-id tx-ops]}]
   (let [[[_ _ {balance-before :balance}]
@@ -557,11 +561,12 @@
           {:debit (Math/abs difference-balance)
            :description "withdraw"})))))
 
-(->> log
-     (keep (partial grab-audit-item 1))
-     (map-indexed (fn [i item]
-                    (assoc item :sequence i)))
-     reverse)
+(comment
+  (->> log
+       (keep (partial grab-audit-item 1))
+       (map-indexed (fn [i item]
+                      (assoc item :sequence i)))
+       reverse))
 
 (defn audit-log-for-account-id [node id]
   (with-open [cursor (xt/open-tx-log node nil true)]
@@ -571,3 +576,29 @@
            (map-indexed (fn [i item]
                           (assoc item :sequence i)))
            reverse))))
+
+(require '[ruuter.core :as ruuter]
+         '[org.httpkit.server :as http])
+
+(def routes
+  [{:path "/account"
+    :method :post
+    :response (fn [{:keys [body]}]
+                (let [name    (:name (json/read-json (slurp body)))
+                      action  {:type :create-account
+                               :starting-balance 0
+                               :account-number (str (java.util.UUID/randomUUID))
+                               :name name}]
+                  (bank-employee-instructions node action)
+                  {:status 200
+                   :body (-> (:account-number action)
+                             account-number->bank-account
+                             json/write-str)}))}])
+
+
+(def web-server
+  (http/run-server #(ruuter/route routes %) {:port 8080}))
+
+(require '[org.httpkit.client :as http-client])
+
+(slurp (:body @(http-client/post "http://localhost:8080/account" {:body (json/write-str {:name "Mr. Black"})})))
