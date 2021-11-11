@@ -178,7 +178,7 @@
 ;;}
 ;;```
 
-;;BB let's grab the current balance and add the deposited amount, then we submit the database. We will add a match transaction for this, this ensures nothing happened to the entity during getting the current balance and updating it, no infinite money glitches!
+;;BB let's grab the current balance and add the deposited amount, then we submit to the database. We will add a match transaction for this, this ensures nothing happened to the entity during getting the current balance and updating it, no infinite money glitches!
 
 (let [deposit 100
       mr-black-poor (account-number->bank-account 1)
@@ -228,7 +228,6 @@
 
 ;;BB Same as deposits, but adding some checks to the resulting balance
 
-
 (defn withdraw-from-account [amount account-number]
   {:pre [(pos? amount)]}
   (let [before (xt/entity (xt/db node) account-number)
@@ -240,7 +239,9 @@
           (account-number->bank-account account-number))
       (throw (Exception. "Can't withdraw more than you own. Get a capitalism-plus-account for going into debt. It'll be great.")))))
 
-(withdraw-from-account -100 1)
+#_"This pre check error gets Clerk stuck (alpha..), but throws exceptions as it's supposed to."
+
+#_(withdraw-from-account -100 1)
 
 (withdraw-from-account 100 1)
 
@@ -264,7 +265,7 @@
 ;; {
 ;;  amount: 50,
 ;;  "account-number": 800
-;;}
+;; }
 
 ;; Where `:id` describes the sender and `\"account-number\"` the receiver.
 
@@ -278,6 +279,19 @@
 ;;  }
 
 ;;BB in this case we match both the before and after accounts.
+
+;;create accounts so our transactions don't error
+(xt/submit-tx
+ node
+ [[::xt/put {:xt/id 2
+             :name "Mr. White"
+             :account-number 2
+             :balance 1000}]
+  [::xt/put {:xt/id 800
+             :name "Mr. Gray"
+             :account-number 800
+             :balance 1000}]])
+
 
 (defn transfer-amount-from-sender-to-receiver [amount sender-account-number receiver-account-number]
   {:pre [(pos? amount)]}
@@ -302,7 +316,7 @@
 
 (transfer-amount-from-sender-to-receiver 50 2 800)
 
-;;BB This works, but could be improved: it doesn't compose with the deposit and withdraw functions for feature 3 and 4. They do too much for that. We could refactor them to just return the transaction data and do the checks. And this transfer function could then do the actual transaction.
+;;BB This works, but could be improved: it doesn't compose with the deposit and withdraw functions for feature 3 and 4. They do too much for that. We could refactor them to just return the transaction data and do the checks. And transfer-amount-from-sender-to-receiver-composed could then do the actual transaction.
 
 (defn deposit-to-account-composable [amount account-number]
   (let [before (xt/entity (xt/db node) account-number)
@@ -329,6 +343,8 @@
         transaction-data (vector withdraw-tx-data deposit-tx-data)]
     (xt/await-tx node (xt/submit-tx node transaction-data))
     (account-number->bank-account sender-account-number)))
+
+(transfer-amount-from-sender-to-receiver 50 2 800)
 
 ;; ## Feature 6 - Retrieve account audit log
 
