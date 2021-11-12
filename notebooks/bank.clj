@@ -62,29 +62,19 @@
          '[xtdb.api :as xt])
 
 (defn start-xtdb! []
-  (let [_run-at #inst "2021-11-10T15:09:43.090-00:00"]
-    (xt/start-node
-     {:xtdb/tx-log {:kv-store {:xtdb/module 'xtdb.rocksdb/->kv-store
-                               :db-dir (io/file "data/dev/tx-log")
-                               :sync? true}}
-      :xtdb/document-store {:kv-store {:xtdb/module 'xtdb.rocksdb/->kv-store
-                                       :db-dir (io/file "data/dev/doc-store")
-                                       :sync? true}}
-      :xtdb/index-store {:kv-store {:xtdb/module 'xtdb.rocksdb/->kv-store
-                                    :db-dir (io/file "data/dev/index-store")
-                                    :sync? true}}})))
+  (xt/start-node
+   {:xtdb/tx-log {:kv-store {:xtdb/module 'xtdb.rocksdb/->kv-store
+                             :db-dir (io/file "data/dev/tx-log")
+                             :sync? true}}
+    :xtdb/document-store {:kv-store {:xtdb/module 'xtdb.rocksdb/->kv-store
+                                     :db-dir (io/file "data/dev/doc-store")
+                                     :sync? true}}
+    :xtdb/index-store {:kv-store {:xtdb/module 'xtdb.rocksdb/->kv-store
+                                  :db-dir (io/file "data/dev/index-store")
+                                  :sync? true}}}))
 
 
-;;BB: Hmmm, Clerk tries to restart the node when it's still running, which leads to a lockfile error. No biggie, we'll close the node on each namespace refresh and wait a little while to start the node:
-
-(declare node)
-
-(def node
-  (if (bound? (var node))
-    node
-    (start-xtdb!)))
-
-(comment (.close node))
+(defonce node (start-xtdb!))
 
 ;;BB: Now we have a database node to transact and query against we can start working on the first feature. Let's turn the json object into clojure EDN and put it in DB.
 
@@ -461,35 +451,65 @@
     :amount 20
     :from 1}])
 
-(defmulti bank-employee-instructions (comp :type second vector))
+(comment
+  "Clerk doesn't know how to deal with this multimethod yet so have to use a regular function."
+  (defmulti bank-employee-instructions (comp :type second vector))
 
-(defmethod bank-employee-instructions :create-account
-  [node {:keys [starting-balance
-                account-number
-                name]}]
-  (->> [[::xt/put (add-account-number-as-id
-                   {:balance starting-balance
-                    :account-number account-number
-                    :name (or name account-number)})]]
-       (xt/submit-tx node)
-       (xt/await-tx node)))
+  (defmethod bank-employee-instructions :create-account
+    [node {:keys [starting-balance
+                  account-number
+                  name]}]
+    (->> [[::xt/put (add-account-number-as-id
+                     {:balance starting-balance
+                      :account-number account-number
+                      :name (or name account-number)})]]
+         (xt/submit-tx node)
+         (xt/await-tx node)))
 
-(defmethod bank-employee-instructions :deposit
-  [node {:keys [amount to]}]
-  (->> (on-node-deposit-to-account node amount to)
-       (xt/submit-tx node)
-       (xt/await-tx node)))
+  (defmethod bank-employee-instructions :deposit
+    [node {:keys [amount to]}]
+    (->> (on-node-deposit-to-account node amount to)
+         (xt/submit-tx node)
+         (xt/await-tx node)))
 
-(defmethod bank-employee-instructions :transfer
-  [node {:keys [amount from to]}]
-  (xt/await-tx node
-               (on-node-transfer-amount-from-sender-to-receiver node amount from to)))
+  (defmethod bank-employee-instructions :transfer
+    [node {:keys [amount from to]}]
+    (xt/await-tx node
+                 (on-node-transfer-amount-from-sender-to-receiver node amount from to)))
 
-(defmethod bank-employee-instructions :withdraw
-  [node {:keys [amount from]}]
-  (->> (on-node-withdraw-from-account node amount from)
-       (xt/submit-tx node)
-       (xt/await-tx node)))
+  (defmethod bank-employee-instructions :withdraw
+    [node {:keys [amount from]}]
+    (->> (on-node-withdraw-from-account node amount from)
+         (xt/submit-tx node)
+         (xt/await-tx node))))
+
+(defn bank-employee-instructions [node {:keys [type] :as task}]
+  (case type
+    :create-account
+    (let [{:keys [starting-balance
+                  account-number
+                  name]} task]
+      (->> [[::xt/put (add-account-number-as-id
+                       {:balance starting-balance
+                        :account-number account-number
+                        :name (or name account-number)})]]
+           (xt/submit-tx node)
+           (xt/await-tx node)))
+    :deposit
+    (let [{:keys [amount to]} task]
+      (->> (on-node-deposit-to-account node amount to)
+           (xt/submit-tx node)
+           (xt/await-tx node)))
+    :withdraw
+    (let [{:keys [amount from]} task]
+      (->> (on-node-withdraw-from-account node amount from)
+           (xt/submit-tx node)
+           (xt/await-tx node)))
+    :transfer
+    (let [{:keys [amount from to]} task]
+      (->> (on-node-transfer-amount-from-sender-to-receiver
+            node amount from to)
+           (xt/await-tx node)))))
 
 (def employee-instructions-working-at-fresh-node
   (partial bank-employee-instructions fresh-node))
@@ -498,41 +518,39 @@
  (for [mutation test-mutations]
    (apply employee-instructions-working-at-fresh-node [mutation])))
 
-(declare log)
-
 (with-open [cursor (xt/open-tx-log fresh-node nil true)]
   (let [result (iterator-seq cursor)]
     (def log result)))
 
-;;BB As we can see the log has information on the transactions as they happened. We can deduce that the fourth transaction was a deposit, the fifth a transfer etc. from the tx operations. Then shape the response into the desired {:sequence x :debit y :description z} format. After filtering and shaping the log we reverse it for the chronological order requirement. I would recommend using the tx-id for the sequence to stay close to the data the database uses: Note that since we use two match and puts in the same transaction for transfers we wouldn't have a -by-one-incremented- sequence id. So to stay true to the assignment we'll assign a sequence id manually.
+;;BB The log has information on the transactions as they happened. We can deduce that the fourth transaction was a deposit, the fifth a transfer etc. from the tx operations. Then shape the response into the desired {:sequence x :debit y :description z} format. After filtering and shaping the log we reverse it for the chronological order requirement. I would recommend using the tx-id for the sequence to stay close to the data the database uses: Note that since we use two match and puts in the same transaction for transfers we wouldn't have a -by-one-incremented- sequence id. So to stay true to the assignment we'll assign a sequence id manually.
 
-(comment
-  (let [{::xt/keys [tx-id tx-ops]} (nth log 3)
-        [[_ _ {balance-before :balance}]
-         [_ {balance-after :balance}]] tx-ops
-        difference-balance (- balance-after balance-before)]
-    (if (pos? difference-balance)
-      {:credit difference-balance
-       :description "deposit"}
-      {:debit (Math/abs difference-balance)
-       :description "withdraw"}))
 
-  (let [audit-log-for-account 1
-        {::xt/keys [tx-id tx-ops]} (nth log 4) ;;(nth log 5)
-        [[_ _ {balance-before :balance}]
-         [_ {balance-after :balance
-             sender-account :account-number}]
-         _
-         [_ {receiver-account :account-number}]] tx-ops
-        difference-balance (- balance-after balance-before)]
-    (cond (= receiver-account audit-log-for-account)
-          {:debit (Math/abs difference-balance)
-           :description
-           (str "receive from #" sender-account)}
-          (= sender-account audit-log-for-account)
-          {:debit (Math/abs difference-balance)
-           :description
-           (str "send to #" receiver-account)})))
+(let [{::xt/keys [tx-id tx-ops]} (nth log 3)
+      [[_ _ {balance-before :balance}]
+       [_ {balance-after :balance}]] tx-ops
+      difference-balance (- balance-after balance-before)]
+  (if (pos? difference-balance)
+    {:credit difference-balance
+     :description "deposit"}
+    {:debit (Math/abs difference-balance)
+     :description "withdraw"}))
+
+(let [audit-log-for-account 1
+      {::xt/keys [tx-id tx-ops]} (nth log 4) ;;(nth log 5)
+      [[_ _ {balance-before :balance}]
+       [_ {balance-after :balance
+           sender-account :account-number}]
+       _
+       [_ {receiver-account :account-number}]] tx-ops
+      difference-balance (- balance-after balance-before)]
+  (cond (= receiver-account audit-log-for-account)
+        {:debit (Math/abs difference-balance)
+         :description
+         (str "receive from #" sender-account)}
+        (= sender-account audit-log-for-account)
+        {:debit (Math/abs difference-balance)
+         :description
+         (str "send to #" receiver-account)}))
 
 (defn grab-audit-item [audit-log-for-account {::xt/keys [tx-id tx-ops]}]
   (let [[[_ _ {balance-before :balance}]
@@ -561,12 +579,11 @@
           {:debit (Math/abs difference-balance)
            :description "withdraw"})))))
 
-(comment
-  (->> log
-       (keep (partial grab-audit-item 1))
-       (map-indexed (fn [i item]
-                      (assoc item :sequence i)))
-       reverse))
+(->> log
+     (keep (partial grab-audit-item 1))
+     (map-indexed (fn [i item]
+                    (assoc item :sequence i)))
+     reverse)
 
 (defn audit-log-for-account-id [node id]
   (with-open [cursor (xt/open-tx-log node nil true)]
@@ -647,72 +664,92 @@
                            json/write-str)})}])
 
 
-(def web-server
+(defonce web-server
   (http/run-server #(ruuter/route routes %) {:port 8080}))
 
 (require '[org.httpkit.client :as http-client])
 
-(-> "http://localhost:8080/account"
-    (http-client/post  {:body (json/write-str {:name "Mr. White"})})
-    deref
-    :body
-    slurp
-    json/read-json
-    :account-number)
-;; => "b8db85a0-f913-40cb-a255-4c0e49385d73"
 
-(-> "http://localhost:8080/account/b8db85a0-f913-40cb-a255-4c0e49385d73"
-    (http-client/get)
-    deref
-    :body
-    slurp
-    json/read-json)
+(comment "some rough testing the api directly"
 
-;; => {:balance 0, :account-number "b8db85a0-f913-40cb-a255-4c0e49385d73", :name "Mr. White"}
+         (defonce created-account-number
+           (-> "http://localhost:8080/account"
+               (http-client/post  {:body (json/write-str {:name "Mr. White"})})
+               deref
+               :body
+               slurp
+               json/read-json
+               :account-number))
 
+         (-> (str "http://localhost:8080/account/" created-account-number)
+             (http-client/get)
+             deref
+             :body
+             slurp
+             json/read-json)
 
-(-> "http://localhost:8080/account/b8db85a0-f913-40cb-a255-4c0e49385d73/deposit"
-    (http-client/post {:body (json/write-str {:amount 100})})
-    deref
-    :body
-    slurp
-    json/read-json
-    )
-;; => {:balance 100, :account-number "b8db85a0-f913-40cb-a255-4c0e49385d73", :name "Mr. White"}
+         (-> (str "http://localhost:8080/account/"
+                  created-account-number
+                  "/deposit")
+             (http-client/post {:body (json/write-str {:amount 100})})
+             deref
+             :body
+             slurp
+             json/read-json)
 
-(-> "http://localhost:8080/account/b8db85a0-f913-40cb-a255-4c0e49385d73/withdraw"
-    (http-client/post {:body (json/write-str {:amount 20})})
-    deref
-    :body
-    slurp
-    json/read-json
-    )
-;; => {:balance 180, :account-number "b8db85a0-f913-40cb-a255-4c0e49385d73", :name "Mr. White"}
+         (-> (str "http://localhost:8080/account/"
+                  created-account-number
+                  "/withdraw")
+             (http-client/post {:body (json/write-str {:amount 20})})
+             deref
+             :body
+             slurp
+             json/read-json)
 
-(-> "http://localhost:8080/account"
-    (http-client/post  {:body (json/write-str {:name "Mr. Red"})})
-    deref
-    :body
-    slurp
-    json/read-json
-    :account-number)
-;; => "89432648-8dd9-4287-a2a8-928cd053b116"
+         (defonce other-account-number
+           (-> "http://localhost:8080/account"
+               (http-client/post  {:body (json/write-str {:name "Mr. Red"})})
+               deref
+               :body
+               slurp
+               json/read-json
+               :account-number))
 
-(-> "http://localhost:8080/account/b8db85a0-f913-40cb-a255-4c0e49385d73/send"
-    (http-client/post {:body (json/write-str {:amount 30
-                                              :account-number "89432648-8dd9-4287-a2a8-928cd053b116"})})
-    deref
-    :body
-    slurp
-    json/read-json
-    )
-;; => {:balance 150, :account-number "b8db85a0-f913-40cb-a255-4c0e49385d73", :name "Mr. White"}
+         (-> (str "http://localhost:8080/account/"
+                  created-account-number
+                  "/send")
+             (http-client/post {:body (json/write-str {:amount 30
+                                                       :account-number other-account-number})})
+             deref
+             )
 
-(-> "http://localhost:8080/account/b8db85a0-f913-40cb-a255-4c0e49385d73/audit"
-    (http-client/post {:body (json/write-str {})})
-    deref
-    :body
-    slurp
-    json/read-json
-    )
-;; => [{:debit 30, :description "send to #89432648-8dd9-4287-a2a8-928cd053b116", :sequence 3} {:debit 20, :description "withdraw", :sequence 2} {:credit 100, :description "deposit", :sequence 1} {:credit 100, :description "deposit", :sequence 0}]
+         (-> (str "http://localhost:8080/account/"
+                  other-account-number
+                  "/send")
+             (http-client/post {:body (json/write-str {:amount 15
+                                                       :account-number created-account-number})})
+             deref
+
+             )
+
+         (-> (str "http://localhost:8080/account/"
+                  created-account-number
+                  "/audit")
+             (http-client/post {:body (json/write-str {})})
+             deref
+             :body
+             slurp
+             json/read-json)
+
+         "pmap is not a perfect async map, but completes fast enough to say it the api can handle 1000 concurrent requests"
+
+         (with-out-str (time (doall (pmap (fn [i]
+                                            (-> "http://localhost:8080/account"
+                                                (http-client/post  {:body (json/write-str {:name (str "Mr. White " i)})})
+                                                deref
+                                                :body
+                                                slurp
+                                                json/read-json
+                                                :account-number))
+                                          (range 1000)))))
+         "\"Elapsed time: 1981.191208 msecs\"\n")
