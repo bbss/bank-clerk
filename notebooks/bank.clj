@@ -581,8 +581,8 @@
          '[org.httpkit.server :as http])
 
 (def routes
-  [{:path "/account"
-    :method :post
+  [{:path     "/account"
+    :method   :post
     :response (fn [{:keys [body]}]
                 (let [name    (:name (json/read-json (slurp body)))
                       action  {:type :create-account
@@ -593,7 +593,58 @@
                   {:status 200
                    :body (-> (:account-number action)
                              account-number->bank-account
-                             json/write-str)}))}])
+                             json/write-str)}))}
+   {:path     "/account/:id"
+    :method   :get
+    :response (fn [{:keys [params]}]
+                {:status 200
+                 :body (-> (:id params)
+                           account-number->bank-account
+                           json/write-str)})}
+   {:path     "/account/:id/deposit"
+    :method   :post
+    :response (fn [{:keys [body params]}]
+                (let [amount (:amount (json/read-json (slurp body)))
+                      action  {:type :deposit
+                               :amount amount
+                               :to (:id params)}]
+                  (bank-employee-instructions node action)
+                  {:status 200
+                   :body (-> (:id params)
+                             account-number->bank-account
+                             json/write-str)}))}
+   {:path     "/account/:id/withdraw"
+    :method   :post
+    :response (fn [{:keys [body params]}]
+                (let [amount  (:amount (json/read-json (slurp body)))
+                      action  {:type :withdraw
+                               :amount amount
+                               :from (:id params)}]
+                  (bank-employee-instructions node action)
+                  {:status 200
+                   :body (-> (:id params)
+                             account-number->bank-account
+                             json/write-str)}))}
+   {:path     "/account/:id/send"
+    :method   :post
+    :response (fn [{:keys [body params]}]
+                (let [{:keys [amount account-number]}
+                      (json/read-json (slurp body))
+                      action  {:type   :transfer
+                               :amount amount
+                               :from  (:id params)
+                               :to    account-number}]
+                  (bank-employee-instructions node action)
+                  {:status 200
+                   :body (-> (:id params)
+                             account-number->bank-account
+                             json/write-str)}))}
+   {:path     "/account/:id/audit"
+    :method   :post
+    :response (fn [{:keys [body params]}]
+                {:status 200
+                 :body (-> (audit-log-for-account-id node (:id params))
+                           json/write-str)})}])
 
 
 (def web-server
@@ -601,4 +652,67 @@
 
 (require '[org.httpkit.client :as http-client])
 
-(slurp (:body @(http-client/post "http://localhost:8080/account" {:body (json/write-str {:name "Mr. Black"})})))
+(-> "http://localhost:8080/account"
+    (http-client/post  {:body (json/write-str {:name "Mr. White"})})
+    deref
+    :body
+    slurp
+    json/read-json
+    :account-number)
+;; => "b8db85a0-f913-40cb-a255-4c0e49385d73"
+
+(-> "http://localhost:8080/account/b8db85a0-f913-40cb-a255-4c0e49385d73"
+    (http-client/get)
+    deref
+    :body
+    slurp
+    json/read-json)
+
+;; => {:balance 0, :account-number "b8db85a0-f913-40cb-a255-4c0e49385d73", :name "Mr. White"}
+
+
+(-> "http://localhost:8080/account/b8db85a0-f913-40cb-a255-4c0e49385d73/deposit"
+    (http-client/post {:body (json/write-str {:amount 100})})
+    deref
+    :body
+    slurp
+    json/read-json
+    )
+;; => {:balance 100, :account-number "b8db85a0-f913-40cb-a255-4c0e49385d73", :name "Mr. White"}
+
+(-> "http://localhost:8080/account/b8db85a0-f913-40cb-a255-4c0e49385d73/withdraw"
+    (http-client/post {:body (json/write-str {:amount 20})})
+    deref
+    :body
+    slurp
+    json/read-json
+    )
+;; => {:balance 180, :account-number "b8db85a0-f913-40cb-a255-4c0e49385d73", :name "Mr. White"}
+
+(-> "http://localhost:8080/account"
+    (http-client/post  {:body (json/write-str {:name "Mr. Red"})})
+    deref
+    :body
+    slurp
+    json/read-json
+    :account-number)
+;; => "89432648-8dd9-4287-a2a8-928cd053b116"
+
+(-> "http://localhost:8080/account/b8db85a0-f913-40cb-a255-4c0e49385d73/send"
+    (http-client/post {:body (json/write-str {:amount 30
+                                              :account-number "89432648-8dd9-4287-a2a8-928cd053b116"})})
+    deref
+    :body
+    slurp
+    json/read-json
+    )
+;; => {:balance 150, :account-number "b8db85a0-f913-40cb-a255-4c0e49385d73", :name "Mr. White"}
+
+(-> "http://localhost:8080/account/b8db85a0-f913-40cb-a255-4c0e49385d73/audit"
+    (http-client/post {:body (json/write-str {})})
+    deref
+    :body
+    slurp
+    json/read-json
+    )
+;; => [{:debit 30, :description "send to #89432648-8dd9-4287-a2a8-928cd053b116", :sequence 3} {:debit 20, :description "withdraw", :sequence 2} {:credit 100, :description "deposit", :sequence 1} {:credit 100, :description "deposit", :sequence 0}]
